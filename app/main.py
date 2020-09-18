@@ -97,10 +97,9 @@ def create_app(test_config=None):
                     True
                     ).label('geom'),
                 ]).where(ohm_items.c.layer == l).alias('q')
-            qs.append(select([func.ST_AsMVT(column('q'), l, 2**12, 'geom')]).select_from(subq))
-
-        ua = union(*qs)
-        tile = db.scalar(ua)
+            q = select([func.ST_AsMVT(column('q'), l, 2**12, 'geom')]).select_from(subq)
+            qs.append(db.scalar(q))
+        tile = b''.join(qs)
 
         response = make_response(tile)
         response.headers['Content-Type'] = "application/x-protobuf"
@@ -110,7 +109,6 @@ def create_app(test_config=None):
     def map_single(jdata):
         ss = shape(jdata['geometry'])
         pdata = jdata['properties']
-        print(jdata)
         return dict(
             ohm_from = jdata['from'],
             ohm_to = jdata['to'],
