@@ -1,10 +1,6 @@
-
-FROM tiangolo/meinheld-gunicorn-flask:python3.7
-
-RUN pip install meinheld gunicorn
-
-COPY requirements.txt /app
-RUN pip install -r /app/requirements.txt
-ENV MODULE_NAME=tileserver
-
-COPY ./app /app
+FROM python:3.9
+WORKDIR /srv
+COPY ./requirements.txt /srv/requirements.txt
+RUN pip install --no-cache-dir --upgrade -r /srv/requirements.txt
+COPY ./app /srv/app
+CMD ["uvicorn", "app.tileserver:app", "--host", "0.0.0.0", "--port", "80"]
