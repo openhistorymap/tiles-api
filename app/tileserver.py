@@ -19,6 +19,14 @@ from flask import request, make_response
 from flask import jsonify
 from flask_cors import CORS
 
+from fastapi import FastAPI, Body
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+
+from pydantic import BaseModel
+
+from typing import List, Any, Iterable, Dict, Optional, Union
+
 import xxhash
 
 POSTGRES = os.environ.get('POSTGRES', '51.15.160.236:25432')
@@ -67,9 +75,6 @@ def get_month(x, year_step = EPHEMERAL_STEP):
     i = nyr.index(x)
     return yr[i-1]
 
-class ST_AsMVT(GenericFunction):
-    type = BYTEA
-
 def float_to_date(f):
     y = int(f)
     m = int((f-y)*12)+1
@@ -77,9 +82,7 @@ def float_to_date(f):
     return '{}-{}-{}'.format(y,m,d)
 
 def create_app(test_config=None):
-    # create and configure the app
-    app = Flask(__name__, instance_relative_config=True)
-    # pool_pre_ping should help handle DB connection drops
+    app = FastAPI()
     
     engine = create_engine('postgresql://{}:{}@{}/{}'.format(
             POSTGRES_USER, POSTGRES_PASS, POSTGRES, POSTGRES_DBNAME
@@ -88,85 +91,36 @@ def create_app(test_config=None):
     db = engine.connect()
     cache = Redis(REDIS_HOST, REDIS_PORT, REDIS_DB)
 
-
-    exp = {
-        "boundary": {
-            "name": {
-                "Rome": {
-                    "color": "#8e001c"
-                },
-                "Lotharingia": {
-                    "color": "#ddb318"
-                },
-                "Kingdom of Italy": {
-                    "color": "#6397d0"
-                }
-            }
-        }
-    }
-
-    metadata = MetaData()
-    ohm_items = Table('items', metadata,
-        Column('id', Integer, primary_key=True, autoincrement=True),
-        Column('ohm_from', Float, index=True),
-        Column('ohm_to', Float, index=True),
-        Column('layer', String, index=True),
-        Column('properties', JSONB),
-        Column('geom', Geometry(geometry_type='GEOMETRY', srid=3857)),
-        Column('author', String, default='ohm'),
-    )
-    ohm_rels = Table('relations', metadata,
-        Column('id', Integer, primary_key=True, autoincrement=True),
-        Column('ohm_from', Float, index=True),
-        Column('ohm_to', Float, index=True),
-        Column('layer', String, index=True),
-        Column('properties', JSONB),
-        Column('geom', Geometry()),
-        Column('author', String, default='ohm'),
-    )
-
-    ohm_rel_members = Table('relation_members', metadata, 
-        Column('id', Integer, primary_key=True, autoincrement=True),
-        Column('relation', Integer, index=True),
-        Column('item', Integer, index=True),
-        Column('role', String, index=True),
-        Column('author', String, default='ohm'),
-    )
-
     project = partial(
         pyproj.transform,
         pyproj.Proj(init='epsg:4326'), # source coordinate system
         pyproj.Proj(init='epsg:3857')) # destination coordinate system
 
-    @app.route('/')
-    def index():
+    @app.get('/')
+    async def index():
         return ''
 
-    @app.route('/<timeline>/<year>/<z>/<y>/<x>/vector.pbf')
-    def properties(year,z,y,x, timeline = 'default'):
-        def gen():
-            yr = get_month(float(year))
-            iz = int(z)
-            iy = int(y)
-            ix = int(x)
-            layers = request.args.get('layers', TILES_LAYERS).split(',')
-            debug = request.args.get('debug')
+    @app.get('/{timeline}/{year}/{z}/{y}/{x}/vector.pbf', response_model=Any)
+    async def tiles(year: float, z: int, y: int, x: int, timeline: str = 'default', layers: str = TILES_LAYERS, debug: bool =False):
+        layers = layers.split(',')
+        gen_tiles = gen(z, x, y, year, layers, timeline, debug)
+        return StreamingResponse(gen_tiles, media_type='application/x-protobuf',)
+
+    async def gen(iz, ix, iy, year, layers, timeline, debug)->Iterable[Any]:
+            yr = get_month(year)
             zl = [2,4,6,8,12,20,24]
             zf = ([2] + list(filter(lambda x: x <= iz, zl)))[-1]
             qs = []
             for l in layers:
                 params = {'zf': zf, 'layer': l, 'year': yr, 'yeart': yr + get_step(l),  'z': iz, 'x': ix, 'y': iy}
                 #k = "{layer}::{z}::{x}::{y}::{year}".format(**params)
-                q = get_tile_for(params, debug)
+                q = await get_tile_for(params, debug)
                 if (q):
                     tile = db.scalar(q)
                     #cache.set(k, tile)
                     yield b''.join([tile])
 
-        return Response(stream_with_context(gen()), mimetype='application/x-protobuf',)
-
-
-    def get_tile_for(params, debug):
+    async def get_tile_for(params, debug):
         if params['z'] < limit_zoom and params['layer'] not in filters.keys():
             return None
         fltr = filters.get(params['layer'])
@@ -221,8 +175,21 @@ def create_app(test_config=None):
 
         return rets
 
-    @app.route('/relation/<relations>', methods=['GET'])
-    def getRelations(relations):
+    class GJGeometry(BaseModel):
+        type: str
+        coordinates: Union[List[float], List[List[float]]]
+
+    class GJFeature(BaseModel):
+        type: str
+        geometry: GJGeometry
+        properties: Any
+
+    class GJFeatureCollection(BaseModel):
+        type: str
+        features: List[GJFeature]
+
+    @app.get('/relation/{relations}', response_model=GJFeatureCollection)
+    async def get_relations(relations: str):
         rels = relations.split('|')
         fts = []
         for rel in rels:    
@@ -259,13 +226,11 @@ def create_app(test_config=None):
         x['geom'] = json.loads(x['geom'])
         return x
 
-    @app.route('/events/<date>', methods=['GET'])
-    def getEvents(date):
-        d = []
-        return json.dumps(d)
+    @app.get('/events/{date}')
+    async def get_events(date:float):
+        """Get Events"""
+        return []
     
-    CORS(app, resources={r"*": {"origins": "*"}})
-    Gzip(app)
     return app
 
 app = create_app()
