@@ -1,8 +1,4 @@
-from sqlalchemy import create_engine, MetaData, Table, Column, Integer, String, DateTime, Float, and_, or_
-from sqlalchemy.dialects import postgresql
-from geoalchemy2 import Geometry
-from geoalchemy2.functions import GenericFunction, ST_AsMVTGeom,  ST_TileEnvelope
-from sqlalchemy.dialects.postgresql import BYTEA, JSONB
+from sqlalchemy import create_engine, 
 import mercantile
 from functools import partial
 import pyproj
@@ -13,12 +9,6 @@ import json
 
 from redis import Redis
 
-from flask_gzip import Gzip
-from flask import Flask, Response, stream_with_context
-from flask import request, make_response
-from flask import jsonify
-from flask_cors import CORS
-
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -26,8 +16,6 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from typing import List, Any, Iterable, Dict, Optional, Union
-
-import xxhash
 
 POSTGRES = os.environ.get('POSTGRES', '51.15.160.236:25432')
 POSTGRES_USER = os.environ.get('POSTGRES_USER', 'admin')
