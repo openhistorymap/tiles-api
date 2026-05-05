@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, 
+from sqlalchemy import create_engine, text
 import mercantile
 from functools import partial
 import pyproj
@@ -6,12 +6,14 @@ from shapely.ops import transform
 from shapely.geometry import shape, MultiPolygon, MultiPoint, MultiLineString
 import os
 import json
+import asyncio
+import hashlib
 
 from redis import Redis
 
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 
 from pydantic import BaseModel
 
@@ -71,12 +73,19 @@ def float_to_date(f):
 
 def create_app(test_config=None):
     app = FastAPI()
-    
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["ETag"],
+    )
+
     engine = create_engine('postgresql://{}:{}@{}/{}'.format(
             POSTGRES_USER, POSTGRES_PASS, POSTGRES, POSTGRES_DBNAME
         ), pool_size=20, max_overflow=0, pool_pre_ping=True,
         echo=False)
-    db = engine.connect()
     cache = Redis(REDIS_HOST, REDIS_PORT, REDIS_DB)
 
     project = partial(
@@ -84,45 +93,75 @@ def create_app(test_config=None):
         pyproj.Proj(init='epsg:4326'), # source coordinate system
         pyproj.Proj(init='epsg:3857')) # destination coordinate system
 
+    TILE_SQL = text("""
+        SELECT COALESCE(
+                  string_agg(ohm_tile(:z, :x, :y, :yr, lyr, fld, lmt), ''::bytea),
+                  ''::bytea)
+        FROM unnest(CAST(:layers AS text[]),
+                    CAST(:fields AS text[]),
+                    CAST(:limits AS int[])) AS t(lyr, fld, lmt)
+    """)
+
+    def _build_specs(z, layer_list):
+        # (layer, admin_level_field, admin_level_limit) per layer to query.
+        # At z<limit_zoom, drop layers that aren't in `filters` and apply the
+        # admin_level cap to the ones that are. Above limit_zoom, query all.
+        specs = []
+        for l in layer_list:
+            fltr = filters.get(l)
+            if z < limit_zoom:
+                if not fltr:
+                    continue
+                specs.append((l, fltr['field'], fltr['value'](z)))
+            else:
+                specs.append((l, None, None))
+        return specs
+
+    def _fetch_tile_sync(z, x, y, yr, specs, debug):
+        if not specs:
+            return b''
+        layers_arr = [s[0] for s in specs]
+        fields_arr = [s[1] for s in specs]
+        limits_arr = [s[2] for s in specs]
+        params = {
+            'z': z, 'x': x, 'y': y, 'yr': yr,
+            'layers': layers_arr,
+            'fields': fields_arr,
+            'limits': limits_arr,
+        }
+        if debug:
+            print('TILE_SQL params:', params)
+        with engine.connect() as conn:
+            result = conn.execute(TILE_SQL, params).scalar()
+        return bytes(result) if result is not None else b''
+
     @app.get('/')
     async def index():
         return ''
 
-    @app.get('/{timeline}/{year}/{z}/{y}/{x}/vector.pbf', response_model=Any)
-    async def tiles(year: float, z: int, y: int, x: int, timeline: str = 'default', layers: str = TILES_LAYERS, debug: bool =False):
-        layers = layers.split(',')
-        gen_tiles = gen(z, x, y, year, layers, timeline, debug)
-        return StreamingResponse(gen_tiles, media_type='application/x-protobuf',)
+    @app.get('/{timeline}/{year}/{z}/{y}/{x}/vector.pbf')
+    async def tiles(request: Request, year: float, z: int, y: int, x: int,
+                    timeline: str = 'default', layers: str = TILES_LAYERS,
+                    debug: bool = False):
+        yr = get_month(year)
+        specs = _build_specs(z, layers.split(','))
 
-    async def gen(iz, ix, iy, year, layers, timeline, debug)->Iterable[Any]:
-            yr = get_month(year)
-            zl = [2,4,6,8,12,20,24]
-            zf = ([2] + list(filter(lambda x: x <= iz, zl)))[-1]
-            qs = []
-            for l in layers:
-                params = {'zf': zf, 'layer': l, 'year': yr, 'yeart': yr + get_step(l),  'z': iz, 'x': ix, 'y': iy}
-                #k = "{layer}::{z}::{x}::{y}::{year}".format(**params)
-                q = await get_tile_for(params, debug)
-                if (q):
-                    tile = db.scalar(q)
-                    #cache.set(k, tile)
-                    yield b''.join([tile])
+        # Run the (sync) DB call off the event loop so concurrent tile
+        # requests don't serialize on a single worker.
+        body = await asyncio.to_thread(_fetch_tile_sync, z, x, y, yr, specs, debug)
 
-    async def get_tile_for(params, debug):
-        if params['z'] < limit_zoom and params['layer'] not in filters.keys():
-            return None
-        fltr = filters.get(params['layer'])
-        if fltr and params['z'] < limit_zoom:
-            params['field'] = fltr.get('field')
-            params['value'] = fltr.get('value')(params['z'])
-            tq = "select ohm_tile({z}, {x}, {y}, {year}, '{layer}', '{field}', {value})"
-        else:
-            tq = "select ohm_tile({z}, {x}, {y}, {year}, '{layer}')"
-        q = tq.format(**params)
-        
-        if debug:
-            print(q)
-        return q
+        etag = '"' + hashlib.md5(body).hexdigest() + '"'
+        cache_headers = {
+            'ETag': etag,
+            'Cache-Control': 'public, max-age=3600',
+        }
+        if request.headers.get('if-none-match') == etag:
+            return Response(status_code=304, headers=cache_headers)
+        return Response(
+            content=body,
+            media_type='application/x-protobuf',
+            headers=cache_headers,
+        )
 
     def out_rel_feat(r):
         rets = []
@@ -176,20 +215,23 @@ def create_app(test_config=None):
         type: str
         features: List[GJFeature]
 
+    REL_SQL = text("""
+        select items.*, st_asgeojson(ST_Transform(items.geom, 4326)) as gg
+        from items
+        join relation_members on items.id = relation_members.item
+        join relations on relations.id = relation_members.relation
+        where relations.id = :rel
+        order by items.ohm_from asc
+    """)
+
     @app.get('/relation/{relations}', response_model=GJFeatureCollection)
     async def get_relations(relations: str):
         rels = relations.split('|')
         fts = []
-        for rel in rels:    
-            q = """
-            select items.*, st_asgeojson(ST_Transform(items.geom, 4326)) as gg
-            from items
-            join relation_members on items.id = relation_members.item
-            join relations on relations.id = relation_members.relation
-            where relations.id = {rel}
-            order by items.ohm_from asc
-            """.format(rel=rel)
-            fts.append({'rel': rel, 'itms': list(db.execute(q))})
+        with engine.connect() as conn:
+            for rel in rels:
+                fts.append({'rel': rel,
+                            'itms': list(conn.execute(REL_SQL, {'rel': rel}))})
         
         flatten = lambda l: [item for sublist in l for item in sublist]
 

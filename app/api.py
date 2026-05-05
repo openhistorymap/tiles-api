@@ -8,10 +8,10 @@ from shapely.ops import transform
 from shapely.geometry import shape, MultiPolygon, MultiPoint, MultiLineString
 import numpy
 from redis import Redis
-from pydantic import BaseModel
 
 from fastapi import FastAPI, Body
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 from typing import Optional, Any, Union,List
 
 REDIS_HOST = os.environ.get('REDIS_HOST', 'localhost')

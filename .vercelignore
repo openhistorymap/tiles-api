@@ -1,0 +1,22 @@
+bin/
+include/
+lib/
+share/
+local/
+*.pyc
+__pycache__/
+
+# Editor backups
+app/api copy.py
+
+# Docker build inputs (Vercel doesn't use them)
+Dockerfile.api
+Dockerfile.tileserver
+requirements.txt
+
+# Ingest / worker / bots — deployed via Docker, not Vercel.
+# app/tileserver.py is the only module the Vercel function imports.
+app/api.py
+app/bots.py
+app/db.py
+app/bot/
